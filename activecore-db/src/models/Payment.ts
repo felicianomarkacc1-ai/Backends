@@ -1,12 +1,11 @@
-
-
-   export interface Payment {
+export interface Payment {
     id?: number;
     userId: number;
     amount: number;
     paymentMethod: string;
     membershipType: string;
     subscriptionStart?: string;
+    subscriptionId?: string;      // new optional field
     subscriptionEnd?: string;
     paymentDate?: Date;
     paymentStatus?: 'pending' | 'completed' | 'failed' | 'pending_approval';

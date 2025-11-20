@@ -39,9 +39,11 @@ export const validatePayment = (payment: Partial<Payment>): string[] => {
     errors.push('User ID is required');
   }
 
-  if (!payment.subscriptionId) {
-    errors.push('Subscription ID is required');
+  if (!payment.subscriptionEnd) {
+    errors.push('Subscription end date is required');
   }
+
+  const id = (payment as any).subscriptionId;
 
   return errors;
 };
