@@ -82,3 +82,43 @@ INSERT INTO rewards (title, description, required_attendance, points, category, 
 ('Massage Therapy Session', '45-minute relaxation massage session', 25, 75, 'service', '💆'),
 ('ActiveCore Gym Bag', 'Premium branded gym bag with compartments', 30, 40, 'product', '🎒')
 ON DUPLICATE KEY UPDATE title=title;
+
+-- Ensure user_meal_preferences exists before meal_plans (already present)
+CREATE TABLE IF NOT EXISTS user_meal_preferences (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  user_id INT NOT NULL,
+  preferences JSON,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  UNIQUE KEY user_pref_unique (user_id)
+);
+
+-- Create meal_plans if missing with correct columns
+CREATE TABLE IF NOT EXISTS meal_plans (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  user_id INT NOT NULL,
+  preference_id INT NULL,
+  plan_name VARCHAR(255) DEFAULT NULL,
+  plan_data LONGTEXT NOT NULL,             -- JSON may be stored as LONGTEXT for compatibility
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP, -- code checks for created_at
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (preference_id) REFERENCES user_meal_preferences(id) ON DELETE SET NULL,
+  INDEX idx_meal_user (user_id),
+  INDEX idx_meal_pref (preference_id)
+);
+
+-- If table already existed but lacks columns, add them safely
+ALTER TABLE meal_plans
+  ADD COLUMN IF NOT EXISTS preference_id INT NULL AFTER user_id,
+  ADD COLUMN IF NOT EXISTS plan_name VARCHAR(255) DEFAULT NULL AFTER preference_id,
+  ADD COLUMN IF NOT EXISTS plan_data LONGTEXT NOT NULL AFTER plan_name,
+  ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE AFTER plan_data,
+  ADD COLUMN IF NOT EXISTS created_at DATETIME DEFAULT CURRENT_TIMESTAMP AFTER is_active,
+  ADD COLUMN IF NOT EXISTS updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at;
+
+-- Ensure foreign key to user_meal_preferences exists (skip if already present)
+ALTER TABLE meal_plans
+  ADD CONSTRAINT IF NOT EXISTS fk_meal_plan_pref FOREIGN KEY (preference_id)
+    REFERENCES user_meal_preferences(id) ON DELETE SET NULL;

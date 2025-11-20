@@ -429,24 +429,22 @@ async function safeOpenAICompletionsCreate(params: any, timeoutMs = 12000): Prom
   }
 }
 
-// Utility: ensure a user preference row exists; return its id or null
+// helper to ensure a user's preference exists. creates one if none.
 async function ensureUserPreferenceExists(userId: number): Promise<number | null> {
   try {
-    const [rows] = await pool.query<any[]>('SELECT id FROM user_meal_preferences WHERE user_id = ?', [userId]);
-    if (Array.isArray(rows) && rows.length > 0) {
-      return Number(rows[0].id);
-    }
+    const [rows] = await pool.query<any[]>(
+      'SELECT id FROM user_meal_preferences WHERE user_id = ? LIMIT 1',
+      [userId]
+    );
+    if (rows && rows.length > 0) return rows[0].id;
 
     const [insertResult] = await pool.query<any>(
-      `INSERT INTO user_meal_preferences (user_id, preferences, created_at)
-       VALUES (?, ?, NOW())`,
-      [ userId, JSON.stringify({}) ]
+      'INSERT INTO user_meal_preferences (user_id, preferences, created_at) VALUES (?, ?, NOW())',
+      [userId, JSON.stringify({})]
     );
-
-    return Number(insertResult.insertId || null);
-  } catch (err: any) {
-    // Use the helper to extract message safely
-    console.warn('Failed to ensure preference exists:', getErrorMessage(err));
+    return (insertResult as any).insertId || null;
+  } catch (err) {
+    console.warn('ensureUserPreferenceExists error', err);
     return null;
   }
 }
@@ -1544,72 +1542,110 @@ async function dbColumnExists(table: string, column: string): Promise<boolean> {
 // ===== MEAL-PLANNER: Save (create/update) - tolerant to generated_at/updated_at schema =====
 app.post('/api/meal-planner/save', authenticateToken, async (req: AuthRequest, res: Response) => {
   try {
-    const userId = req.user!.id;
-    const { planId, planName, mealPlan } = req.body;
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
-    if (!mealPlan || !Array.isArray(mealPlan)) {
-      return res.status(400).json({ success: false, message: 'Invalid mealPlan payload' });
-    }
-
-    // ensure preference exists if needed (unchanged)
+    // Accept and validate client preference_id only if it belongs to the user and is numeric
     let preferenceId: number | null = null;
-    try {
-      const [prefRows] = await pool.query<any[]>('SELECT id FROM user_meal_preferences WHERE user_id = ?', [userId]);
-      if (Array.isArray(prefRows) && prefRows.length > 0) {
-        preferenceId = Number(prefRows[0].id);
-      } else {
+    const requestedPrefRaw = req.body?.preference_id;
+    const requestedPrefId = typeof requestedPrefRaw === 'string' || typeof requestedPrefRaw === 'number'
+      ? Number(requestedPrefRaw)
+      : NaN;
+
+    if (!isNaN(requestedPrefId) && requestedPrefId > 0) {
+      try {
+        const [rows] = await pool.query<any>('SELECT id, user_id FROM user_meal_preferences WHERE id = ? LIMIT 1', [requestedPrefId]);
+        if (Array.isArray(rows) && rows.length > 0 && Number(rows[0].user_id) === Number(userId)) {
+          preferenceId = Number(rows[0].id);
+        } else {
+          // Provided preference id is invalid or does not belong to the user — ignore it and ensure user's preference instead.
+          console.warn(`Provided preference_id ${requestedPrefId} is invalid or does not belong to user ${userId}. Falling back to ensureUserPreferenceExists.`);
+          preferenceId = await ensureUserPreferenceExists(userId);
+        }
+      } catch (e) {
+        console.warn('Error validating provided preference_id; falling back to ensureUserPreferenceExists', e);
         preferenceId = await ensureUserPreferenceExists(userId);
       }
-    } catch (err: any) {
+    } else {
+      // No valid preference_id provided: ensure there is one for the user
+      preferenceId = await ensureUserPreferenceExists(userId);
+    }
+
+    // If preferenceId is still non-numeric, set to null to avoid FK errors
+    if (!preferenceId || Number.isNaN(Number(preferenceId))) {
       preferenceId = null;
     }
 
-    // Update (if planId provided) - use schema-aware column usage
-    if (planId) {
-      const hasUpdatedAt = await dbColumnExists('meal_plans', 'updated_at');
-      try {
-        if (hasUpdatedAt) {
-          await pool.query('UPDATE meal_plans SET plan_name = ?, plan_data = ?, updated_at = NOW() WHERE id = ?', [
-            planName || null, JSON.stringify({ weekPlan: mealPlan }), planId
-          ]);
-        } else {
-          await pool.query('UPDATE meal_plans SET plan_name = ?, plan_data = ? WHERE id = ?', [
-            planName || null, JSON.stringify({ weekPlan: mealPlan }), planId
-          ]);
-        }
-
-        return res.json({ success: true, message: 'Meal plan updated', planId });
-      } catch (updateErr: any) {
-        console.warn('Update meal plan failed:', getErrorMessage(updateErr));
-        return res.status(500).json({ success: false, message: 'Failed to update meal plan', error: getErrorMessage(updateErr) });
-      }
-    }
-
-    // Insert new plan - handle generated_at if present
+    // Build insert using preferenceId (nullable)
+    const conn = await pool.getConnection();
     try {
-      const hasGeneratedAt = await dbColumnExists('meal_plans', 'generated_at');
+      await conn.beginTransaction();
 
-      const insertCols = preferenceId === null
-        ? (hasGeneratedAt ? 'user_id, plan_name, plan_data, generated_at' : 'user_id, plan_name, plan_data')
-        : (hasGeneratedAt ? 'user_id, preference_id, plan_name, plan_data, generated_at' : 'user_id, preference_id, plan_name, plan_data');
+      const planData = req.body?.plan || req.body?.mealPlan || null; // adjust to your payload key
+      const planName = req.body?.planName || req.body?.name || 'My Meal Plan';
+
+      // If planData is missing return an error to avoid attempted invalid inserts
+      if (!planData) {
+        await conn.rollback();
+        conn.release();
+        return res.status(400).json({ success: false, message: 'Missing plan data' });
+      }
+
+      // Determine which timestamp column exists (generated_at or created_at)
+      const hasGeneratedAt = await dbColumnExists('meal_plans', 'generated_at');
+      const hasCreatedAt = await dbColumnExists('meal_plans', 'created_at');
+      const timestampCol = hasGeneratedAt ? 'generated_at' : (hasCreatedAt ? 'created_at' : null);
+
+      // Determine which plan data column exists (plan_data or plan)
+      const hasPlanData = await dbColumnExists('meal_plans', 'plan_data');
+      const hasPlan = await dbColumnExists('meal_plans', 'plan');
+      const planDataCol = hasPlanData ? 'plan_data' : (hasPlan ? 'plan' : null);
+
+      if (!planDataCol) {
+        await conn.rollback();
+        conn.release();
+        console.error('Missing plan_data/plan column in meal_plans table');
+        return res.status(500).json({ success: false, message: 'Server misconfigured: plan column missing' });
+      }
+
+      // Build columns & values depending on whether preferenceId is present
+      const insertColsArr = preferenceId === null
+        ? ['user_id', 'plan_name', planDataCol]
+        : ['user_id', 'preference_id', 'plan_name', planDataCol];
+
+      if (timestampCol) insertColsArr.push(timestampCol);
+      const insertCols = insertColsArr.join(', ');
 
       const insertValsBase = preferenceId === null
-        ? [userId, planName || null, JSON.stringify({ weekPlan: mealPlan })]
-        : [userId, preferenceId, planName || null, JSON.stringify({ weekPlan: mealPlan })];
-
-      const insertVals = hasGeneratedAt ? [...insertValsBase, new Date()] : insertValsBase;
-
+        ? [userId, planName, JSON.stringify(planData)]
+        : [userId, preferenceId, planName, JSON.stringify(planData)];
+      const insertVals = timestampCol ? [...insertValsBase, new Date()] : insertValsBase;
       const qMarks = insertVals.map(() => '?').join(', ');
-      const [result] = await pool.query<any>(`INSERT INTO meal_plans (${insertCols}) VALUES (${qMarks})`, insertVals);
-      const newId = (result as any)?.insertId || null;
-      return res.status(201).json({ success: true, message: 'Meal plan saved', planId: newId });
-    } catch (insertErr: any) {
-      console.error('Insert meal plan failed:', getErrorMessage(insertErr));
-      return res.status(500).json({ success: false, message: 'Failed to save meal plan', error: getErrorMessage(insertErr) });
+
+      // Debug log - safe for dev only
+      console.log('DEBUG - Meal plan INSERT:', `INSERT INTO meal_plans (${insertCols}) VALUES (${qMarks})`, insertVals.map(v => typeof v).join(','));
+
+      const [insertResult] = await conn.query(
+        `INSERT INTO meal_plans (${insertCols}) VALUES (${qMarks})`,
+        insertVals
+      );
+
+      await conn.commit();
+      conn.release();
+
+      // Return a planId property expected by the frontend (back-compat)
+      const planId = (insertResult as any).insertId;
+      return res.json({ success: true, planId, id: planId });
+
+    } catch (e) {
+      await conn.rollback();
+      conn.release();
+      console.error('Failed to save meal plan (transaction):', e);
+      return res.status(500).json({ success: false, message: 'Failed to save meal plan' });
     }
   } catch (err: any) {
-    console.error('Save meal plan error:', getErrorMessage(err));
-    return res.status(500).json({ success: false, message: 'Failed to save meal plan', error: getErrorMessage(err) });
+    console.error('MealPlanner save error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to save meal plan' });
   }
 });
 
@@ -1625,7 +1661,7 @@ app.get('/api/meal-planner/plans', authenticateToken, async (req: AuthRequest, r
     if (hasUpdatedAt) cols.push('updated_at');
 
     const orderBy = hasGeneratedAt ? 'generated_at' : 'id';
-    const [rows] = await pool.query<any[]>(`SELECT ${cols.join(', ')} FROM meal_plans WHERE user_id = ? ORDER BY ${orderBy} DESC`, [userId]);
+    const [rows] = await pool.query<any>(`SELECT ${cols.join(', ')} FROM meal_plans WHERE user_id = ? ORDER BY ${orderBy} DESC`, [userId]);
 
     const plans = rows.map((r: any) => ({
       id: Number(r.id),
@@ -1655,7 +1691,7 @@ app.get('/api/meal-planner/plans/:id', authenticateToken, async (req: AuthReques
     if (hasGeneratedAt) cols.push('generated_at');
     if (hasUpdatedAt) cols.push('updated_at');
 
-    const [rows] = await pool.query<any[]>(`SELECT ${cols.join(', ')} FROM meal_plans WHERE id = ?`, [planId]);
+    const [rows] = await pool.query<any>(`SELECT ${cols.join(', ')} FROM meal_plans WHERE id = ?`, [planId]);
     if (!rows || rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Plan not found' });
     }
@@ -1682,7 +1718,7 @@ app.get('/api/meal-planner/plans/:id', authenticateToken, async (req: AuthReques
         data: parsed,
       },
     });
-  } catch (err: any) {
+   } catch (err: any) {
     console.error('Load meal plan error:', getErrorMessage(err));
     res.status(500).json({ success: false, message: 'Failed to load meal plan', error: getErrorMessage(err) });
   }
@@ -1717,6 +1753,7 @@ app.delete('/api/meal-planner/plans/:id', authenticateToken, async (req: AuthReq
 
 // QR Attendance Check-in Route
 app.post('/api/attendance/checkin', authenticateToken, async (req: AuthRequest, res: Response) => {
+
   try {
     const userId = req.user!.id;
     const { qrToken, location } = req.body;
@@ -1745,6 +1782,7 @@ app.post('/api/attendance/checkin', authenticateToken, async (req: AuthRequest, 
     );
 
     res.json({
+     
       success: true,
       message: "Check-in successful."
     });
